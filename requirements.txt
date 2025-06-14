@@ -10,8 +10,3 @@ tqdm
 markdown
 python-multipart
 setuptools
-playwright
-markdownify
-sentence-transformers
-faiss-cpu
-torch
