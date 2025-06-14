@@ -1,0 +1,19 @@
+# Ignore directories
+downloaded_threads/
+markdown_files/
+__pycache__/
+venv/
+.venv/
+.mypy_cache/
+.pytest_cache/
+.vscode/
+.idea/
+vector_db/
+
+# Ignore files
+.env
+preprocess.py
+*.pyc
+.DS_Store
+metadata.json
+auth.json
