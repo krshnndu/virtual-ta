@@ -23,10 +23,10 @@ logger = logging.getLogger(__name__)
 
 # Constants
 DB_PATH = "knowledge_base.db"
-SIMILARITY_THRESHOLD = 0.20  # Much lower threshold to catch more content
-MAX_RESULTS = 25  # Increased to get more context
+SIMILARITY_THRESHOLD = 0.50  # Lowered threshold for better recall
+MAX_RESULTS = 10  # Increased to get more context
 load_dotenv()
-MAX_CONTEXT_CHUNKS = 10  # Increased number of chunks per source
+MAX_CONTEXT_CHUNKS = 4  # Increased number of chunks per source
 API_KEY = os.getenv("API_KEY")  # Get API key from environment variable
 
 # Models
@@ -183,43 +183,14 @@ async def get_embedding(text, max_retries=3):
             await asyncio.sleep(3 * retries)  # Wait before retry
 
 # Function to find similar content in the database with improved logic
-async def find_similar_content(query_embedding, conn, question):
+async def find_similar_content(query_embedding, conn):
     try:
         logger.info("Finding similar content in database")
         cursor = conn.cursor()
         results = []
         
-        # First try exact URL matches
-        logger.info("Checking for exact URL matches")
-        cursor.execute("""
-        SELECT id, post_id, topic_id, topic_title, post_number, author, created_at, 
-               likes, chunk_index, content, url, embedding 
-        FROM discourse_chunks 
-        WHERE url LIKE ?
-        """, (f"%{question.split()[-1]}%",))  # Try to match the last word of the question
-        
-        exact_matches = cursor.fetchall()
-        for chunk in exact_matches:
-            url = chunk["url"]
-            if not url.startswith("http"):
-                url = f"https://discourse.onlinedegree.iitm.ac.in/t/{url}"
-            
-            results.append({
-                "source": "discourse",
-                "id": chunk["id"],
-                "post_id": chunk["post_id"],
-                "topic_id": chunk["topic_id"],
-                "title": chunk["topic_title"],
-                "url": url,
-                "content": chunk["content"],
-                "author": chunk["author"],
-                "created_at": chunk["created_at"],
-                "chunk_index": chunk["chunk_index"],
-                "similarity": 1.0  # Exact match gets highest similarity
-            })
-        
-        # Then do semantic search
-        logger.info("Performing semantic search")
+        # Search discourse chunks
+        logger.info("Querying discourse chunks")
         cursor.execute("""
         SELECT id, post_id, topic_id, topic_title, post_number, author, created_at, 
                likes, chunk_index, content, url, embedding 
@@ -236,33 +207,26 @@ async def find_similar_content(query_embedding, conn, question):
                 embedding = json.loads(chunk["embedding"])
                 similarity = cosine_similarity(query_embedding, embedding)
                 
-                # Check for partial matches in content
-                content_lower = chunk["content"].lower()
-                query_lower = question.lower()
-                has_partial_match = any(word in content_lower for word in query_lower.split())
-                
-                if similarity >= SIMILARITY_THRESHOLD or has_partial_match:
+                if similarity >= SIMILARITY_THRESHOLD:
                     # Ensure URL is properly formatted
                     url = chunk["url"]
                     if not url.startswith("http"):
                         # Fix missing protocol
                         url = f"https://discourse.onlinedegree.iitm.ac.in/t/{url}"
                     
-                    # Check if this URL is already in results
-                    if not any(r["url"] == url for r in results):
-                        results.append({
-                            "source": "discourse",
-                            "id": chunk["id"],
-                            "post_id": chunk["post_id"],
-                            "topic_id": chunk["topic_id"],
-                            "title": chunk["topic_title"],
-                            "url": url,
-                            "content": chunk["content"],
-                            "author": chunk["author"],
-                            "created_at": chunk["created_at"],
-                            "chunk_index": chunk["chunk_index"],
-                            "similarity": float(similarity)
-                        })
+                    results.append({
+                        "source": "discourse",
+                        "id": chunk["id"],
+                        "post_id": chunk["post_id"],
+                        "topic_id": chunk["topic_id"],
+                        "title": chunk["topic_title"],
+                        "url": url,
+                        "content": chunk["content"],
+                        "author": chunk["author"],
+                        "created_at": chunk["created_at"],
+                        "chunk_index": chunk["chunk_index"],
+                        "similarity": float(similarity)
+                    })
                 
                 processed_count += 1
                 if processed_count % 1000 == 0:
@@ -270,6 +234,47 @@ async def find_similar_content(query_embedding, conn, question):
                     
             except Exception as e:
                 logger.error(f"Error processing discourse chunk {chunk['id']}: {e}")
+        
+        # Search markdown chunks
+        logger.info("Querying markdown chunks")
+        cursor.execute("""
+        SELECT id, doc_title, original_url, downloaded_at, chunk_index, content, embedding 
+        FROM markdown_chunks 
+        WHERE embedding IS NOT NULL
+        """)
+        
+        markdown_chunks = cursor.fetchall()
+        logger.info(f"Processing {len(markdown_chunks)} markdown chunks")
+        processed_count = 0
+        
+        for chunk in markdown_chunks:
+            try:
+                embedding = json.loads(chunk["embedding"])
+                similarity = cosine_similarity(query_embedding, embedding)
+                
+                if similarity >= SIMILARITY_THRESHOLD:
+                    # Ensure URL is properly formatted
+                    url = chunk["original_url"]
+                    if not url or not url.startswith("http"):
+                        # Use a default URL if missing
+                        url = f"https://docs.onlinedegree.iitm.ac.in/{chunk['doc_title']}"
+                    
+                    results.append({
+                        "source": "markdown",
+                        "id": chunk["id"],
+                        "title": chunk["doc_title"],
+                        "url": url,
+                        "content": chunk["content"],
+                        "chunk_index": chunk["chunk_index"],
+                        "similarity": float(similarity)
+                    })
+                
+                processed_count += 1
+                if processed_count % 1000 == 0:
+                    logger.info(f"Processed {processed_count}/{len(markdown_chunks)} markdown chunks")
+                    
+            except Exception as e:
+                logger.error(f"Error processing markdown chunk {chunk['id']}: {e}")
         
         # Sort by similarity (descending)
         results.sort(key=lambda x: x["similarity"], reverse=True)
@@ -399,19 +404,8 @@ async def generate_answer(question, relevant_results, max_retries=2):
                 context += f"\n\n{source_type} (URL: {result['url']}):\n{result['content'][:1500]}"
             
             # Prepare improved prompt
-            prompt = f"""You are a helpful teaching assistant for the TDS course. Answer the following question based ONLY on the provided context. 
+            prompt = f"""Answer the following question based ONLY on the provided context. 
             If you cannot answer the question based on the context, say "I don't have enough information to answer this question."
-            
-            Important guidelines:
-            1. Be precise and concise in your answers
-            2. Always include relevant URLs from the context
-            3. If the question is about course policies or requirements, be explicit about the requirements
-            4. If multiple options are available (like using different tools), explain the trade-offs
-            5. For technical questions, provide specific details from the documentation
-            6. If the question is about specific tools or technologies, mention both recommended and alternative options
-            7. Always cite your sources using the exact URLs provided in the context
-            8. For questions about course tools or infrastructure, explain both the recommended and alternative options
-            9. For questions about scoring or grading, provide specific details about how scores are calculated and displayed
             
             Context:
             {context}
@@ -440,10 +434,10 @@ async def generate_answer(question, relevant_results, max_retries=2):
             payload = {
                 "model": "gpt-4o-mini",
                 "messages": [
-                    {"role": "system", "content": "You are a helpful teaching assistant that provides accurate answers based only on the provided context. Always include sources in your response with exact URLs."},
+                    {"role": "system", "content": "You are a helpful assistant that provides accurate answers based only on the provided context. Always include sources in your response with exact URLs."},
                     {"role": "user", "content": prompt}
                 ],
-                "temperature": 0.2  # Balanced temperature for consistent outputs
+                "temperature": 0.3  # Lower temperature for more deterministic outputs
             }
             
             async with aiohttp.ClientSession() as session:
@@ -545,7 +539,7 @@ def parse_llm_response(response):
         # If that doesn't work, try alternative formats
         if len(parts) == 1:
             # Try other possible headings
-            for heading in ["Source:", "References:", "Reference:", "URLs:", "Links:"]:
+            for heading in ["Source:", "References:", "Reference:"]:
                 if heading in response:
                     parts = response.split(heading, 1)
                     break
@@ -567,8 +561,8 @@ def parse_llm_response(response):
                 line = re.sub(r'^-\s*', '', line)
                 
                 # Extract URL and text using more flexible patterns
-                url_match = re.search(r'URL:\s*\[(.*?)\]|url:\s*\[(.*?)\]|\[(http[^\]]+)\]|URL:\s*(http\S+)|url:\s*(http\S+)|(http\S+)', line, re.IGNORECASE)
-                text_match = re.search(r'Text:\s*\[(.*?)\]|text:\s*\[(.*?)\]|[""](.*?)[""]|Text:\s*"(.*?)"|text:\s*"(.*?)"', line, re.IGNORECASE)
+                url_match = re.search(r'URL:\s*\[(.?)\]|url:\s\[(.?)\]|\[(http[^\]]+)\]|URL:\s(http\S+)|url:\s*(http\S+)|(http\S+)', line, re.IGNORECASE)
+                text_match = re.search(r'Text:\s*\[(.?)\]|text:\s\[(.?)\]|[""](.?)[""]|Text:\s*"(.?)"|text:\s"(.*?)"', line, re.IGNORECASE)
                 
                 if url_match:
                     # Find the first non-None group from the regex match
@@ -587,30 +581,7 @@ def parse_llm_response(response):
                     
                     # Only add if we have a valid URL
                     if url and url.startswith("http"):
-                        # Check if this URL is already in links
-                        if not any(link["url"] == url for link in links):
-                            links.append({"url": url, "text": text})
-        
-        # If no links were found in the response, try to extract URLs from the answer
-        if not links:
-            url_pattern = r'https?://[^\s<>"]+|www\.[^\s<>"]+'
-            urls = re.findall(url_pattern, answer)
-            for url in urls:
-                if url.startswith("http") and not any(link["url"] == url for link in links):
-                    # Try to find context around the URL
-                    url_index = answer.find(url)
-                    start = max(0, url_index - 50)
-                    end = min(len(answer), url_index + len(url) + 50)
-                    context = answer[start:end].strip()
-                    links.append({"url": url, "text": context})
-        
-        # If still no links, try to extract from the entire response
-        if not links:
-            url_pattern = r'https?://[^\s<>"]+|www\.[^\s<>"]+'
-            urls = re.findall(url_pattern, response)
-            for url in urls:
-                if url.startswith("http") and not any(link["url"] == url for link in links):
-                    links.append({"url": url, "text": "Mentioned in response"})
+                        links.append({"url": url, "text": text})
         
         logger.info(f"Parsed answer (length: {len(answer)}) and {len(links)} sources")
         return {"answer": answer, "links": links}
@@ -651,7 +622,7 @@ async def query_knowledge_base(request: QueryRequest):
             
             # Find similar content
             logger.info("Finding similar content")
-            relevant_results = await find_similar_content(query_embedding, conn, request.question)
+            relevant_results = await find_similar_content(query_embedding, conn)
             
             if not relevant_results:
                 logger.info("No relevant results found")
@@ -754,4 +725,4 @@ async def health_check():
         )
 
 if __name__ == "__main__":
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True) 
+    uvicorn.run("app:app", host="127.0.0.1", port=5000, reload=True)
